@@ -1,0 +1,2 @@
+add_executable(horn_schunck horn_schunck.cu)
+target_compile_features(horn_schunck PRIVATE cxx_std_17 cuda_std_17)

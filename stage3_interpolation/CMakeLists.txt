@@ -1,0 +1,2 @@
+add_executable(frame_interp frame_interp.cu)
+target_compile_features(frame_interp PRIVATE cxx_std_17 cuda_std_17)
