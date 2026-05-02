@@ -4,12 +4,13 @@
  * ∂u/∂t = D_u ∇²u - u·v² + F·(1-u)
  * ∂v/∂t = D_v ∇²v + u·v² - (F+k)·v
  *
- * 双场耦合 PDE，4 种典型斑图:
+ * 双场耦合 PDE，典型斑图:
  *   F=0.04,  k=0.06  → spots
  *   F=0.035, k=0.065 → stripes
  *   F=0.025, k=0.06  → mazes
- *   F=0.012, k=0.05  → solitons
  */
+
+#include <argparse/argparse.hpp>
 
 #include <cmath>
 #include <cstdio>
@@ -23,44 +24,28 @@
 #include <cuda/cmath>
 
 // =================================================================
-//  Laplacian helpers (device)
+//  Device helpers
 // =================================================================
 
-// TODO: 实现 __device__ 函数 laplacian9  (9-point stencil, O(h⁴))
-//       推导 ∇²f ≈ [4(N+S+E+W) + (NE+NW+SE+SW) - 20·C] / (6·h²)
-//       但 Gray-Scott 通常 h=1, 梯度系数被吸收到 D 中，除以 dx² 即可
-
 __device__ float laplacian5(const float *f, int idx, int W) {
-  // TODO: 返回 5-point Laplacian (除以 h², 这里 h=1)
-  //       即 f[idx-W] + f[idx+W] + f[idx-1] + f[idx+1] - 4*f[idx]
-  return 0.0f;
+  return f[idx - W] + f[idx + W] + f[idx - 1] + f[idx + 1] - 4.0f * f[idx];
 }
 
 __device__ float laplacian9(const float *f, int idx, int W) {
-  // TODO: 返回 9-point Laplacian (除以 6·h²)
-  //       [4*(f[idx-W]+f[idx+W]+f[idx-1]+f[idx+1])
-  //        + (f[idx-W-1]+f[idx-W+1]+f[idx+W-1]+f[idx+W+1])
-  //        - 20*f[idx]] / 6.0f
-  return 0.0f;
+  return (4.0f * (f[idx - W] + f[idx + W] + f[idx - 1] + f[idx + 1])
+          + (f[idx - W - 1] + f[idx - W + 1] + f[idx + W - 1] + f[idx + W + 1])
+          - 20.0f * f[idx]) / 6.0f;
 }
 
-// =================================================================
-//  反应项 (device): 每个时间积分方法都需要重复计算
-// =================================================================
-
-struct Reaction {
-  float du, dv;
-};
+struct Reaction { float du, dv; };
 
 __device__ Reaction reaction(float u, float v, float F, float k) {
-  // TODO: 计算反应项
-  //       du = -u*v*v + F*(1 - u)
-  //       dv =  u*v*v - (F + k)*v
-  return {0.0f, 0.0f};
+  float uvv = u * v * v;
+  return { -uvv + F * (1.0f - u), uvv - (F + k) * v };
 }
 
 // =================================================================
-//  CUDA kernel — Euler forward (1 阶)
+//  Kernels — Euler / RK2 / RK4
 // =================================================================
 
 __global__ void gsEuler(const float *u, const float *v,
@@ -72,22 +57,17 @@ __global__ void gsEuler(const float *u, const float *v,
   if (i >= W - 1 || j >= H - 1) return;
   int idx = j * W + i;
 
-  // TODO: Euler 前向步
-  //  1. 计算 Laplacian:  lap_u = laplacian5(u, idx, W)
-  //                       lap_v = laplacian5(v, idx, W)
-  //  2. 计算反应项:      auto r = reaction(u[idx], v[idx], F, k)
-  //  3. 更新:           u_new[idx] = u[idx] + dt * (Du * lap_u + r.du)
-  //                     v_new[idx] = v[idx] + dt * (Dv * lap_v + r.dv)
-  //  4. Clamp:          u_new[idx] = fminf(fmaxf(u_new[idx], 0.0f), 1.0f)
-  //                     v_new[idx] = fminf(fmaxf(v_new[idx], 0.0f), 1.0f)
+  float u0 = u[idx], v0 = v[idx];
+  float lap_u = laplacian5(u, idx, W);
+  float lap_v = laplacian5(v, idx, W);
+  auto r = reaction(u0, v0, F, k);
 
-  u_new[idx] = u[idx];
-  v_new[idx] = v[idx];
+  float un = u0 + dt * (Du * lap_u + r.du);
+  float vn = v0 + dt * (Dv * lap_v + r.dv);
+
+  u_new[idx] = fminf(fmaxf(un, 0.0f), 1.0f);
+  v_new[idx] = fminf(fmaxf(vn, 0.0f), 1.0f);
 }
-
-// =================================================================
-//  CUDA kernel — RK2 (中点法, 2 阶)
-// =================================================================
 
 __global__ void gsRK2(const float *u, const float *v,
                       float *u_new, float *v_new,
@@ -99,34 +79,25 @@ __global__ void gsRK2(const float *u, const float *v,
   int idx = j * W + i;
 
   float u0 = u[idx], v0 = v[idx];
+  float lap_u = laplacian5(u, idx, W);
+  float lap_v = laplacian5(v, idx, W);
 
-  // TODO: RK2 中点法
-  //  k1:
-  //    lap_u = laplacian5(u, idx, W)
-  //    lap_v = laplacian5(v, idx, W)
-  //    auto r1 = reaction(u0, v0, F, k)
-  //    k1_u = Du*lap_u + r1.du
-  //    k1_v = Dv*lap_v + r1.dv
-  //
-  //  中点近似 (用邻居的中间值):
-  //    对邻居使用 u + dt/2 * k1_?   近似
-  //    或者直接在 local 计算: u_mid = u0 + dt/2 * k1_u
-  //    lap_u2 ≈ laplacian5(u, idx, W)  // 简化: 复用原 Laplacian
-  //    (实际 RK2 对 PDE 通常用邻居近似, 见 heat_rk4.cu 的做法)
-  //    auto r2 = reaction(u0 + dt/2*k1_u, v0 + dt/2*k1_v, F, k)
-  //    k2_u = Du*lap_u2 + r2.du
-  //    k2_v = Dv*lap_v2 + r2.dv
-  //
-  //    u_new[idx] = u0 + dt * k2_u
-  //    v_new[idx] = v0 + dt * k2_v
+  // k1
+  auto r1 = reaction(u0, v0, F, k);
+  float k1_u = Du * lap_u + r1.du;
+  float k1_v = Dv * lap_v + r1.dv;
 
-  u_new[idx] = u0;
-  v_new[idx] = v0;
+  // k2 (反应项用中点值重新算, Laplacian 近似不变)
+  auto r2 = reaction(u0 + 0.5f * dt * k1_u, v0 + 0.5f * dt * k1_v, F, k);
+  float k2_u = Du * lap_u + r2.du;
+  float k2_v = Dv * lap_v + r2.dv;
+
+  float un = u0 + dt * k2_u;
+  float vn = v0 + dt * k2_v;
+
+  u_new[idx] = fminf(fmaxf(un, 0.0f), 1.0f);
+  v_new[idx] = fminf(fmaxf(vn, 0.0f), 1.0f);
 }
-
-// =================================================================
-//  CUDA kernel — RK4 (4 阶)
-// =================================================================
 
 __global__ void gsRK4(const float *u, const float *v,
                       float *u_new, float *v_new,
@@ -138,46 +109,51 @@ __global__ void gsRK4(const float *u, const float *v,
   int idx = j * W + i;
 
   float u0 = u[idx], v0 = v[idx];
+  float lap_u = laplacian5(u, idx, W);
+  float lap_v = laplacian5(v, idx, W);
 
-  // TODO: RK4
-  //  k1:
-  //    lap_u = laplacian5(u, idx, W), lap_v = laplacian5(v, idx, W)
-  //    auto r1 = reaction(u0, v0, F, k)
-  //    k1_u = Du*lap_u + r1.du  ,  k1_v = Dv*lap_v + r1.dv
-  //
-  //  k2 (用 u0 + dt/2*k1_ ?, 并对邻居做类似近似):
-  //    auto r2 = reaction(u0 + dt/2*k1_u, v0 + dt/2*k1_v, F, k)
-  //    k2_u = Du*lap_u + r2.du  (简化: 复用 Laplacian)
-  //    k2_v = Dv*lap_v + r2.dv
-  //
-  //  k3:
-  //    auto r3 = reaction(u0 + dt/2*k2_u, v0 + dt/2*k2_v, F, k)
-  //    k3_u = Du*lap_u + r3.du
-  //    k3_v = Dv*lap_v + r3.dv
-  //
-  //  k4:
-  //    auto r4 = reaction(u0 + dt*k3_u, v0 + dt*k3_v, F, k)
-  //    k4_u = Du*lap_u + r4.du
-  //    k4_v = Dv*lap_v + r4.dv
-  //
-  //  u_new[idx] = u0 + dt/6 * (k1_u + 2*k2_u + 2*k3_u + k4_u)
-  //  v_new[idx] = v0 + dt/6 * (k1_v + 2*k2_v + 2*k3_v + k4_v)
+  // k1
+  auto r1 = reaction(u0, v0, F, k);
+  float k1_u = Du * lap_u + r1.du;
+  float k1_v = Dv * lap_v + r1.dv;
 
-  u_new[idx] = u0;
-  v_new[idx] = v0;
+  // k2
+  auto r2 = reaction(u0 + 0.5f * dt * k1_u, v0 + 0.5f * dt * k1_v, F, k);
+  float k2_u = Du * lap_u + r2.du;
+  float k2_v = Dv * lap_v + r2.dv;
+
+  // k3
+  auto r3 = reaction(u0 + 0.5f * dt * k2_u, v0 + 0.5f * dt * k2_v, F, k);
+  float k3_u = Du * lap_u + r3.du;
+  float k3_v = Dv * lap_v + r3.dv;
+
+  // k4
+  auto r4 = reaction(u0 + dt * k3_u, v0 + dt * k3_v, F, k);
+  float k4_u = Du * lap_u + r4.du;
+  float k4_v = Dv * lap_v + r4.dv;
+
+  float un = u0 + dt / 6.0f * (k1_u + 2.0f * k2_u + 2.0f * k3_u + k4_u);
+  float vn = v0 + dt / 6.0f * (k1_v + 2.0f * k2_v + 2.0f * k3_v + k4_v);
+
+  u_new[idx] = fminf(fmaxf(un, 0.0f), 1.0f);
+  v_new[idx] = fminf(fmaxf(vn, 0.0f), 1.0f);
 }
 
 // =================================================================
-//  CUDA host helpers
+//  Host helpers
 // =================================================================
 
 void gsInit(float *&d_u, float *&d_v, float *&d_u_new, float *&d_v_new,
             int W, int H, const float *h_u_init, const float *h_v_init) {
   int n = W * H;
-  // TODO: 分配 4 块 device 内存并拷贝初始场
-  // cudaMalloc + cudaMemcpy + cudaMemcpy  (u_new/v_new 用 memset 0)
-  (void)d_u; (void)d_v; (void)d_u_new; (void)d_v_new;
-  (void)n; (void)h_u_init; (void)h_v_init;
+  cudaMalloc(&d_u,     n * sizeof(float));
+  cudaMalloc(&d_v,     n * sizeof(float));
+  cudaMalloc(&d_u_new, n * sizeof(float));
+  cudaMalloc(&d_v_new, n * sizeof(float));
+  cudaMemcpy(d_u,     h_u_init, n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_v,     h_v_init, n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_u_new, h_u_init, n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_v_new, h_v_init, n * sizeof(float), cudaMemcpyHostToDevice);
 }
 
 void gsStep(float *&d_u, float *&d_v, float *&d_u_new, float *&d_v_new,
@@ -187,29 +163,31 @@ void gsStep(float *&d_u, float *&d_v, float *&d_u_new, float *&d_v_new,
   dim3 gridSize(cuda::ceil_div(W - 2, blockSize.x),
                 cuda::ceil_div(H - 2, blockSize.y));
 
-  // TODO: 根据 method 调用不同的 kernel
-  //   0 = Euler, 1 = RK2, 2 = RK4
-  //   gsEuler/gsRK2/gsRK4<<<gridSize, blockSize>>>(d_u, d_v, d_u_new, d_v_new, ...)
+  if (method == 0)
+    gsEuler<<<gridSize, blockSize>>>(d_u, d_v, d_u_new, d_v_new, W, H, dt, Du, Dv, F, k);
+  else if (method == 1)
+    gsRK2<<<gridSize, blockSize>>>(d_u, d_v, d_u_new, d_v_new, W, H, dt, Du, Dv, F, k);
+  else
+    gsRK4<<<gridSize, blockSize>>>(d_u, d_v, d_u_new, d_v_new, W, H, dt, Du, Dv, F, k);
 
-  // TODO: 交换指针 (u ↔ u_new, v ↔ v_new)
-  //   std::swap(d_u, d_u_new); std::swap(d_v, d_v_new);
-  (void)W; (void)H; (void)dt; (void)Du; (void)Dv; (void)F; (void)k; (void)method;
+  std::swap(d_u, d_u_new);
+  std::swap(d_v, d_v_new);
 }
 
 void gsFree(float *d_u, float *d_v, float *d_u_new, float *d_v_new) {
-  // TODO: cudaFree 四块
-  (void)d_u; (void)d_v; (void)d_u_new; (void)d_v_new;
+  cudaFree(d_u); cudaFree(d_v); cudaFree(d_u_new); cudaFree(d_v_new);
 }
 
 void gsCopyToHost(float *h_u, float *h_v,
                   const float *d_u, const float *d_v,
                   int W, int H) {
-  // TODO: cudaMemcpy d_u→h_u, d_v→h_v
-  (void)h_u; (void)h_v; (void)d_u; (void)d_v; (void)W; (void)H;
+  int n = W * H;
+  if (h_u) cudaMemcpy(h_u, d_u, n * sizeof(float), cudaMemcpyDeviceToHost);
+  if (h_v) cudaMemcpy(h_v, d_v, n * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
 // =================================================================
-//  Render: 显示 v 场 (斑图主体), 颜色映射到 [0,1]
+//  Render
 // =================================================================
 
 static void render(const float *v, int W, int H, cv::Mat &display) {
@@ -223,7 +201,7 @@ static void render(const float *v, int W, int H, cv::Mat &display) {
 }
 
 // =================================================================
-//  Trackbar state — 运行时实时调节参数
+//  Trackbar
 // =================================================================
 
 struct Params {
@@ -231,14 +209,12 @@ struct Params {
   float k = 0.06f;
   float Du = 0.16f;
   float Dv = 0.08f;
-  int   method = 0;  // 0=Euler, 1=RK2, 2=RK4
+  int method = 0;  // 0=Euler, 1=RK2, 2=RK4
 };
 
 static Params g_params;
 
-static void onTrackbar(int, void*) {
-  // 空回调，参数直接从 g_params 读取
-}
+static void onTrackbar(int, void*) {}
 
 static void createTrackbars(const char *win) {
   cv::createTrackbar("F * 1000", win, nullptr, 100, onTrackbar);
@@ -247,7 +223,6 @@ static void createTrackbars(const char *win) {
   cv::createTrackbar("Dv * 100", win, nullptr, 100, onTrackbar);
   cv::createTrackbar("method",    win, nullptr, 2,   onTrackbar);
 
-  // 初始值
   cv::setTrackbarPos("F * 1000", win, (int)(g_params.F * 1000));
   cv::setTrackbarPos("k * 1000", win, (int)(g_params.k * 1000));
   cv::setTrackbarPos("Du * 100", win, (int)(g_params.Du * 100));
@@ -263,23 +238,101 @@ static void readTrackbars(const char *win) {
   g_params.method = cv::getTrackbarPos("method", win);
 }
 
+static void syncTrackbars(const char *win) {
+  cv::setTrackbarPos("F * 1000", win, (int)(g_params.F * 1000));
+  cv::setTrackbarPos("k * 1000", win, (int)(g_params.k * 1000));
+  cv::setTrackbarPos("Du * 100", win, (int)(g_params.Du * 100));
+  cv::setTrackbarPos("Dv * 100", win, (int)(g_params.Dv * 100));
+  cv::setTrackbarPos("method",   win, g_params.method);
+}
+
 // =================================================================
 //  Main loop
 // =================================================================
 
-static bool g_paused = true;
+static bool g_paused = false;
 static bool g_running = true;
+static bool g_mouse_down = false;
+
+struct MouseCtx {
+  int w, h;
+  float *h_v;
+  float *d_v;
+};
+
+static void paintBrush(float *v, int w, int h, int x, int y) {
+  constexpr int R = 3;
+  for (int dy = -R; dy <= R; ++dy) {
+    for (int dx = -R; dx <= R; ++dx) {
+      int nx = x + dx, ny = y + dy;
+      if (nx < 1 || nx >= w - 1 || ny < 1 || ny >= h - 1) continue;
+      float rr = (float)(dx * dx + dy * dy) / (R * R);
+      // 画 v 场: 中心 1.0, u 对应位置也设为随机
+      float val = 1.0f * expf(-2.0f * rr);
+      if (val > v[ny * w + nx])
+        v[ny * w + nx] = val;
+    }
+  }
+}
+
+static void onMouse(int event, int x, int y, int flags, void *userdata) {
+  MouseCtx *c = (MouseCtx *)userdata;
+  if (!c || !c->h_v) return;
+
+  if (event == cv::EVENT_LBUTTONDOWN) {
+    g_paused = true;
+    g_mouse_down = true;
+    paintBrush(c->h_v, c->w, c->h, x, y);
+    // upload 9x9 region to d_v
+    for (int dy = -4; dy <= 4; ++dy) {
+      int ny = y + dy;
+      if (ny < 1 || ny >= c->h - 1) continue;
+      int nx0 = (x - 4 < 1) ? 1 : x - 4;
+      int nx1 = (x + 4 >= c->w - 1) ? c->w - 2 : x + 4;
+      int len = nx1 - nx0 + 1;
+      cudaMemcpy(c->d_v + ny * c->w + nx0,
+                 c->h_v + ny * c->w + nx0,
+                 len * sizeof(float), cudaMemcpyHostToDevice);
+    }
+  } else if (event == cv::EVENT_MOUSEMOVE && g_mouse_down) {
+    paintBrush(c->h_v, c->w, c->h, x, y);
+    for (int dy = -4; dy <= 4; ++dy) {
+      int ny = y + dy;
+      if (ny < 1 || ny >= c->h - 1) continue;
+      int nx0 = (x - 4 < 1) ? 1 : x - 4;
+      int nx1 = (x + 4 >= c->w - 1) ? c->w - 2 : x + 4;
+      int len = nx1 - nx0 + 1;
+      cudaMemcpy(c->d_v + ny * c->w + nx0,
+                 c->h_v + ny * c->w + nx0,
+                 len * sizeof(float), cudaMemcpyHostToDevice);
+    }
+  } else if (event == cv::EVENT_LBUTTONUP) {
+    g_mouse_down = false;
+  }
+}
+
+static void resetFields(float *d_u, float *d_v, float *d_u_new, float *d_v_new,
+                         const float *h_u_init, const float *h_v_init, int n) {
+  cudaMemcpy(d_u,     h_u_init, n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_v,     h_v_init, n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_u_new, h_u_init, n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_v_new, h_v_init, n * sizeof(float), cudaMemcpyHostToDevice);
+}
 
 void gsMainLoop(float *d_u, float *d_v, float *d_u_new, float *d_v_new,
-                int W, int H) {
+                int W, int H, int substeps,
+                const float *h_u_init, const float *h_v_init) {
   int n = W * H;
   float dt = 0.02f;
 
   cv::Mat display(H, W, CV_8UC3);
   float *h_v = new float[n];
 
+  MouseCtx mc{ W, H, h_v, d_v };
+
   cv::namedWindow("Gray-Scott", cv::WINDOW_NORMAL);
   createTrackbars("Gray-Scott");
+  cv::setMouseCallback("Gray-Scott", onMouse, &mc);
 
   int step = 0;
   while (g_running) {
@@ -288,7 +341,7 @@ void gsMainLoop(float *d_u, float *d_v, float *d_u_new, float *d_v_new,
     int key = cv::waitKey(1);
     if (key == 27 || key == 'q' || key == 'Q') {
       g_running = false;
-    } else if (key == ' ') {
+    } else if (key == ' ' && !g_mouse_down) {
       g_paused = !g_paused;
       std::cout << (g_paused ? "[PAUSED]" : "[RUNNING]")
                 << "  step=" << step
@@ -296,58 +349,76 @@ void gsMainLoop(float *d_u, float *d_v, float *d_u_new, float *d_v_new,
                 << "  k=" << g_params.k
                 << "  Du=" << g_params.Du
                 << "  Dv=" << g_params.Dv
+                << "  substeps=" << substeps
                 << "  method="
                 << (g_params.method == 0 ? "Euler" :
                     g_params.method == 1 ? "RK2" : "RK4")
-                << "\n";
+                << std::endl;
+    } else if (key == 82 && substeps < 256) {
+      ++substeps;
+      std::cout << "substeps=" << substeps << std::endl;
+    } else if (key == 84 && substeps > 1) {
+      --substeps;
+      std::cout << "substeps=" << substeps << std::endl;
     } else if (key == 'r' || key == 'R') {
-      // TODO: 重置初始场 (全 1 的 u, 中心小 patch 的 v)
+      resetFields(d_u, d_v, d_u_new, d_v_new, h_u_init, h_v_init, n);
       step = 0;
+      std::cout << "[RESET]" << std::endl;
     } else if (key == '1') {
       g_params.F = 0.04f; g_params.k = 0.06f;
       g_params.Du = 0.16f; g_params.Dv = 0.08f;
-      std::cout << "[preset] spots\n";
-      cv::setTrackbarPos("F * 1000", "Gray-Scott", (int)(g_params.F * 1000));
-      cv::setTrackbarPos("k * 1000", "Gray-Scott", (int)(g_params.k * 1000));
+      resetFields(d_u, d_v, d_u_new, d_v_new, h_u_init, h_v_init, n);
+      step = 0;
+      std::cout << "[preset] spots" << std::endl;
+      syncTrackbars("Gray-Scott");
     } else if (key == '2') {
       g_params.F = 0.035f; g_params.k = 0.065f;
       g_params.Du = 0.16f; g_params.Dv = 0.08f;
-      std::cout << "[preset] stripes\n";
-      cv::setTrackbarPos("F * 1000", "Gray-Scott", (int)(g_params.F * 1000));
-      cv::setTrackbarPos("k * 1000", "Gray-Scott", (int)(g_params.k * 1000));
+      resetFields(d_u, d_v, d_u_new, d_v_new, h_u_init, h_v_init, n);
+      step = 0;
+      std::cout << "[preset] stripes" << std::endl;
+      syncTrackbars("Gray-Scott");
     } else if (key == '3') {
       g_params.F = 0.025f; g_params.k = 0.06f;
       g_params.Du = 0.16f; g_params.Dv = 0.08f;
-      std::cout << "[preset] mazes\n";
-      cv::setTrackbarPos("F * 1000", "Gray-Scott", (int)(g_params.F * 1000));
-      cv::setTrackbarPos("k * 1000", "Gray-Scott", (int)(g_params.k * 1000));
+      resetFields(d_u, d_v, d_u_new, d_v_new, h_u_init, h_v_init, n);
+      step = 0;
+      std::cout << "[preset] mazes" << std::endl;
+      syncTrackbars("Gray-Scott");
     }
 
     if (g_paused) {
       gsCopyToHost(nullptr, h_v, nullptr, d_v, W, H);
       render(h_v, W, H, display);
-      cv::setWindowTitle("Gray-Scott", "Gray-Scott [paused]");
-      cv::imshow("Gray-Scott", display);
-      continue;
-    }
-
-    // TODO: 调用 gsStep(d_u, d_v, d_u_new, d_v_new, W, H,
-    //                    dt, g_params.Du, g_params.Dv,
-    //                    g_params.F, g_params.k, g_params.method)
-    ++step;
-
-    if (step % 4 == 0) {
-      gsCopyToHost(nullptr, h_v, nullptr, d_v, W, H);
-      render(h_v, W, H, display);
       char title[64];
       snprintf(title, sizeof(title),
-               "Gray-Scott [step %d | %s]",
-               step,
+               "Gray-Scott [paused]  F=%.3f k=%.3f  %s",
+               g_params.F, g_params.k,
                g_params.method == 0 ? "Euler" :
                g_params.method == 1 ? "RK2" : "RK4");
       cv::setWindowTitle("Gray-Scott", title);
       cv::imshow("Gray-Scott", display);
+      continue;
     }
+
+    for (int s = 0; s < substeps; ++s) {
+      gsStep(d_u, d_v, d_u_new, d_v_new, W, H,
+             dt, g_params.Du, g_params.Dv,
+             g_params.F, g_params.k, g_params.method);
+      ++step;
+    }
+
+    gsCopyToHost(nullptr, h_v, nullptr, d_v, W, H);
+    render(h_v, W, H, display);
+    char title[64];
+    snprintf(title, sizeof(title),
+             "Gray-Scott [step %d | %s | x%d]",
+             step,
+             g_params.method == 0 ? "Euler" :
+             g_params.method == 1 ? "RK2" : "RK4",
+             substeps);
+    cv::setWindowTitle("Gray-Scott", title);
+    cv::imshow("Gray-Scott", display);
   }
 
   cv::destroyAllWindows();
@@ -360,28 +431,60 @@ void gsMainLoop(float *d_u, float *d_v, float *d_u_new, float *d_v_new,
 
 int main(int argc, char **argv) {
   int W = 256, H = 256;
+  int substeps = 16;
 
-  std::cout << "Gray-Scott | " << W << "x" << H << " | CUDA\n";
-  std::cout << "  SPACE = play/pause\n"
-            << "  R     = reset\n"
-            << "  1     = spots  (F=0.04,  k=0.06)\n"
-            << "  2     = stripes(F=0.035,k=0.065)\n"
-            << "  3     = mazes  (F=0.025,k=0.06)\n"
-            << "  trackbars = F, k, Du, Dv, method\n"
-            << "  ESC/Q = quit\n";
+  argparse::ArgumentParser program("grayscott");
+  program.add_description("Gray-Scott reaction-diffusion (CUDA)");
+
+  program.add_argument("-W", "--width")
+      .default_value(256).help("Grid width").store_into(W);
+  program.add_argument("-H", "--height")
+      .default_value(256).help("Grid height").store_into(H);
+  program.add_argument("-n", "--substeps")
+      .default_value(16).help("Simulation steps per frame").store_into(substeps);
+  program.add_argument("--F")
+      .default_value(0.04f).help("Feed rate").store_into(g_params.F);
+  program.add_argument("--k")
+      .default_value(0.06f).help("Kill rate").store_into(g_params.k);
+  program.add_argument("--Du")
+      .default_value(0.16f).help("Diffusion u").store_into(g_params.Du);
+  program.add_argument("--Dv")
+      .default_value(0.08f).help("Diffusion v").store_into(g_params.Dv);
+  program.add_argument("-m", "--method")
+      .default_value(0).help("0=Euler, 1=RK2, 2=RK4").store_into(g_params.method);
+
+  try {
+    program.parse_args(argc, argv);
+  } catch (const std::runtime_error &err) {
+    std::cerr << err.what() << "\n" << program;
+    return 1;
+  }
+
+  std::cout << "Gray-Scott | " << W << "x" << H
+            << " | substeps=" << substeps
+            << " | F=" << g_params.F
+            << " k=" << g_params.k
+            << " Du=" << g_params.Du
+            << " Dv=" << g_params.Dv
+            << " | method="
+            << (g_params.method == 0 ? "Euler" :
+                g_params.method == 1 ? "RK2" : "RK4")
+            << std::endl;
+  std::cout << "  SPACE = play/pause   R = reset\n"
+            << "  1 = spots   2 = stripes   3 = mazes\n"
+            << "  ARROWS = substeps +/-   trackbars = F,k,Du,Dv,method\n"
+            << "  ESC/Q = quit" << std::endl;
 
   int n = W * H;
 
-  // 初始场: u 全 1, v 中心一小块随机
   float *h_u_init = new float[n];
   float *h_v_init = new float[n];
   for (int i = 0; i < n; ++i) {
     h_u_init[i] = 1.0f;
     h_v_init[i] = 0.0f;
   }
-  // v: 中央方形区域随机扰动
+
   int cx = W / 2, cy = H / 2, r = 10;
-  // TODO: 用确定的种子或 rand() 生成初始 v 斑块
   srand(42);
   for (int j = cy - r; j <= cy + r; ++j)
     for (int i = cx - r; i <= cx + r; ++i)
@@ -390,7 +493,7 @@ int main(int argc, char **argv) {
 
   float *d_u, *d_v, *d_u_new, *d_v_new;
   gsInit(d_u, d_v, d_u_new, d_v_new, W, H, h_u_init, h_v_init);
-  gsMainLoop(d_u, d_v, d_u_new, d_v_new, W, H);
+  gsMainLoop(d_u, d_v, d_u_new, d_v_new, W, H, substeps, h_u_init, h_v_init);
   gsFree(d_u, d_v, d_u_new, d_v_new);
 
   delete[] h_u_init;

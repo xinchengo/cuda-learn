@@ -13,5 +13,5 @@ target_include_directories(wave PRIVATE ${OpenCV_INCLUDE_DIRS})
 
 add_executable(grayscott grayscott.cu)
 target_compile_features(grayscott PRIVATE cxx_std_17 cuda_std_17)
-target_link_libraries(grayscott PRIVATE ${OpenCV_LIBS})
+target_link_libraries(grayscott PRIVATE argparse ${OpenCV_LIBS})
 target_include_directories(grayscott PRIVATE ${OpenCV_INCLUDE_DIRS})
